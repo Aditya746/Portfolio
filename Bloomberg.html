@@ -563,7 +563,12 @@ Type HELP to view supported commands.
           `https://finnhub.io/api/v1/${endpoint}?symbol=${encodeURIComponent(providerSymbol)}` +
           `&resolution=15&from=${from}&to=${to}&token=${encodeURIComponent(state.keys.FINNHUB)}`;
         const response = await fetchWithTimeout(url);
-        if (!response.ok) throw new Error(`Finnhub candle failed: HTTP ${response.status}`);
+        if (!response.ok) {
+          if (response.status === 403) {
+            throw new Error("HTTP 403 (candle endpoint blocked for this key/plan, or key not activated yet)");
+          }
+          throw new Error(`Finnhub candle failed: HTTP ${response.status}`);
+        }
         const data = await response.json();
         if (data.s !== "ok" || !Array.isArray(data.c) || data.c.length < 2) {
           throw new Error(`No candle data for ${symbol}`);
@@ -606,9 +611,14 @@ Type HELP to view supported commands.
           drawPriceLine(closes);
           chartStatus.textContent = `Chart: ${state.selectedSymbol} last 24h (15m candles)`;
         } catch (error) {
-          chartStatus.textContent = state.selectedSymbol.includes("-")
-            ? "Chart: symbol not supported on free tier"
-            : `Chart error: ${error.message}`;
+          const message = String(error?.message || "");
+          if (message.includes("HTTP 403")) {
+            chartStatus.textContent = "Chart unavailable: Finnhub candle API rejected (403). Quotes/news can still work.";
+          } else if (state.selectedSymbol.includes("-")) {
+            chartStatus.textContent = "Chart: symbol not supported on free tier";
+          } else {
+            chartStatus.textContent = `Chart error: ${message}`;
+          }
           priceLine.setAttribute("points", "");
         }
         updateChartTitle();
