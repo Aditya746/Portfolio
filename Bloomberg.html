@@ -60,6 +60,35 @@
       font-size: 0.95rem;
     }
 
+    .rates-bar {
+      display: flex;
+      gap: 20px;
+      padding: 7px 14px;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.8rem;
+      color: var(--muted);
+      overflow-x: auto;
+      white-space: nowrap;
+      background: rgba(5, 7, 13, 0.6);
+    }
+
+    .rates-bar span {
+      color: var(--text);
+    }
+
+    .rates-bar .rates-label {
+      color: var(--muted);
+      margin-right: 4px;
+    }
+
+    .rates-bar .up {
+      color: var(--green);
+    }
+
+    .rates-bar .down {
+      color: var(--red);
+    }
+
     .main-grid {
       display: grid;
       grid-template-columns: 1.15fr 2.2fr 1.15fr;
@@ -190,6 +219,28 @@
       white-space: pre-wrap;
     }
 
+    .view-tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+
+    .view-tab {
+      padding: 3px 8px;
+      font-size: 0.75rem;
+      border: 1px solid var(--amber);
+      background: transparent;
+      color: var(--amber);
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .view-tab.active {
+      background: var(--amber);
+      color: #05070d;
+    }
+
     .config-row {
       margin-top: 10px;
       display: grid;
@@ -241,11 +292,13 @@
       <div class="brand">BLOOMBERG-INSPIRED / PERSONAL TERMINAL v0.1</div>
       <div class="clock" id="clock">--:--:--</div>
     </div>
+    <div id="rates-bar" class="rates-bar">Loading rates...</div>
 
     <div class="main-grid">
       <section class="panel">
         <div class="panel-header">WATCHLIST</div>
         <div class="panel-body">
+          <div id="view-tabs" class="view-tabs"></div>
           <table>
             <thead>
               <tr>
@@ -314,6 +367,7 @@ Type HELP to view supported commands.
       const sourceInput = document.getElementById("active-source");
       const statusInput = document.getElementById("status-line");
       const refreshInput = document.getElementById("last-refresh");
+      const ratesBar = document.getElementById("rates-bar");
       const commandOutput = document.getElementById("command-output");
       const input = document.getElementById("command-input");
       const runButton = document.getElementById("run-command");
@@ -321,6 +375,7 @@ Type HELP to view supported commands.
       const priceLine = document.getElementById("price-line");
       const chartPanelTitle = document.getElementById("chart-panel-title");
       const watchlistBody = document.getElementById("watchlist-body");
+      const viewTabs = document.getElementById("view-tabs");
 
       const defaultWatchlist = [
         { symbol: "AAPL", type: "market", last: 0, chg: 0 },
@@ -330,12 +385,57 @@ Type HELP to view supported commands.
         { symbol: "DGS10", type: "fred", last: 0, chg: 0 }
       ];
 
+      const views = {
+        TECH: [
+          { symbol: "AAPL", type: "market" }, { symbol: "MSFT", type: "market" },
+          { symbol: "NVDA", type: "market" }, { symbol: "META", type: "market" },
+          { symbol: "GOOGL", type: "market" }, { symbol: "AMZN", type: "market" },
+          { symbol: "TSLA", type: "market" }, { symbol: "AVGO", type: "market" },
+          { symbol: "AMD", type: "market" }, { symbol: "ORCL", type: "market" },
+          { symbol: "ADBE", type: "market" }, { symbol: "CRM", type: "market" },
+          { symbol: "QCOM", type: "market" }, { symbol: "TXN", type: "market" },
+          { symbol: "ASML", type: "market" }, { symbol: "SAP", type: "market" },
+          { symbol: "SNOW", type: "market" }, { symbol: "PLTR", type: "market" },
+          { symbol: "ARM", type: "market" }, { symbol: "INTC", type: "market" }
+        ],
+        BANKS: [
+          { symbol: "ING", type: "market" }, { symbol: "INGA.AS", type: "market" },
+          { symbol: "JPM", type: "market" }, { symbol: "BAC", type: "market" },
+          { symbol: "GS", type: "market" }, { symbol: "MS", type: "market" },
+          { symbol: "HSBC", type: "market" }, { symbol: "BNP.PA", type: "market" },
+          { symbol: "DB", type: "market" }, { symbol: "UBS", type: "market" },
+          { symbol: "C", type: "market" }
+        ],
+        MACRO: [
+          { symbol: "DGS10", type: "fred" }, { symbol: "DGS2", type: "fred" },
+          { symbol: "DGS30", type: "fred" }, { symbol: "FEDFUNDS", type: "fred" },
+          { symbol: "UNRATE", type: "fred" }, { symbol: "CPIAUCSL", type: "fred" },
+          { symbol: "T10Y2Y", type: "fred" }, { symbol: "ECBDFR", type: "fred" },
+          { symbol: "DEXUSEU", type: "fred" }, { symbol: "DEXJPUS", type: "fred" }
+        ],
+        CRYPTO: [
+          { symbol: "BTC-USD", type: "market" }, { symbol: "ETH-USD", type: "market" },
+          { symbol: "SOL-USD", type: "market" }, { symbol: "XRP-USD", type: "market" },
+          { symbol: "BNB-USD", type: "market" }
+        ]
+      };
+
+      const ratesBarItems = [
+        { label: "EUR/USD", symbol: "DEXUSEU", type: "fred", last: null },
+        { label: "ECB Rate", symbol: "ECBDFR", type: "fred", last: null },
+        { label: "10Y UST", symbol: "DGS10", type: "fred", last: null },
+        { label: "2Y UST", symbol: "DGS2", type: "fred", last: null },
+        { label: "T10Y2Y", symbol: "T10Y2Y", type: "fred", last: null },
+        { label: "USD/JPY", symbol: "DEXJPUS", type: "fred", last: null }
+      ];
+
       const state = {
         source: "FINNHUB",
         keys: { FINNHUB: "", FRED: "" },
         busy: false,
         selectedSymbol: null,
-        refreshIntervalSeconds: 30
+        refreshIntervalSeconds: 30,
+        activeView: "CUSTOM"
       };
 
       const watchlist = [];
@@ -381,6 +481,7 @@ Type HELP to view supported commands.
       }
 
       function saveWatchlist() {
+        if (state.activeView !== "CUSTOM") return;
         const compact = watchlist.map((item) => ({ symbol: item.symbol, type: item.type }));
         localStorage.setItem(WATCHLIST_KEY, JSON.stringify(compact));
       }
@@ -430,6 +531,10 @@ Type HELP to view supported commands.
               Number(parsed.refreshIntervalSeconds) || 30
             );
           }
+          const allowedViews = ["CUSTOM", "TECH", "BANKS", "MACRO", "CRYPTO"];
+          if (parsed.activeView && allowedViews.includes(parsed.activeView)) {
+            state.activeView = parsed.activeView;
+          }
         } catch (error) {
           console.warn("Failed to parse stored config", error);
           localStorage.removeItem(STORAGE_KEY);
@@ -437,9 +542,11 @@ Type HELP to view supported commands.
       }
 
       function loadWatchlist() {
+        watchlist.length = 0;
         const raw = localStorage.getItem(WATCHLIST_KEY);
         if (!raw) {
           defaultWatchlist.forEach((item) => watchlist.push({ ...item }));
+          state.activeView = "CUSTOM";
           return;
         }
         try {
@@ -455,11 +562,13 @@ Type HELP to view supported commands.
             });
           });
           if (watchlist.length === 0) throw new Error("watchlist empty after validation");
+          state.activeView = "CUSTOM";
         } catch (error) {
           console.warn("Failed to parse stored watchlist", error);
           localStorage.removeItem(WATCHLIST_KEY);
           watchlist.length = 0;
           defaultWatchlist.forEach((item) => watchlist.push({ ...item }));
+          state.activeView = "CUSTOM";
         }
       }
 
@@ -470,9 +579,24 @@ Type HELP to view supported commands.
             version: CONFIG_VERSION,
             source: state.source,
             keys: state.keys,
-            refreshIntervalSeconds: state.refreshIntervalSeconds
+            refreshIntervalSeconds: state.refreshIntervalSeconds,
+            activeView: state.activeView
           })
         );
+      }
+
+      /** Restore watchlist from persisted view (preset) or CUSTOM localStorage. */
+      function hydrateWatchlistFromState() {
+        watchlist.length = 0;
+        const presets = ["TECH", "BANKS", "MACRO", "CRYPTO"];
+        if (presets.includes(state.activeView) && views[state.activeView]) {
+          views[state.activeView].forEach((item) =>
+            watchlist.push({ symbol: item.symbol, type: item.type, last: 0, chg: 0 })
+          );
+          return;
+        }
+        state.activeView = "CUSTOM";
+        loadWatchlist();
       }
 
       function updateStatus(message) {
@@ -483,6 +607,7 @@ Type HELP to view supported commands.
       }
 
       function renderWatchlist() {
+        renderViewTabs();
         watchlistBody.innerHTML = watchlist
           .map((item) => {
             const className = item.chg >= 0 ? "up" : "down";
@@ -497,6 +622,37 @@ Type HELP to view supported commands.
             `;
           })
           .join("");
+      }
+
+      function renderViewTabs() {
+        const tabNames = ["CUSTOM", "TECH", "BANKS", "MACRO", "CRYPTO"];
+        viewTabs.innerHTML = tabNames
+          .map((name) => `<button class="view-tab ${state.activeView === name ? "active" : ""}" data-view="${name}" type="button">${name}</button>`)
+          .join("");
+      }
+
+      function renderRatesBar() {
+        const chunks = ratesBarItems.map((item) => {
+          const value = item.last === null || !Number.isFinite(item.last) ? "--" : item.last.toFixed(2);
+          const directionClass = item.last === null || !Number.isFinite(item.chg) ? "" : (item.chg >= 0 ? "up" : "down");
+          return `<span><span class="rates-label">${item.label}</span><span class="${directionClass}">${value}</span></span>`;
+        });
+        ratesBar.innerHTML = chunks.join('<span style="color:#5c6884;">|</span>');
+      }
+
+      async function refreshRatesBar() {
+        if (!state.keys.FRED) return;
+        for (const item of ratesBarItems) {
+          try {
+            const data = await fetchFredSeries(item.symbol);
+            item.last = data.last;
+            item.chg = data.chg;
+          } catch (error) {
+            // keep bar resilient per item
+          }
+          await sleep(250);
+        }
+        renderRatesBar();
       }
 
       function renderNews() {
@@ -670,6 +826,7 @@ Type HELP to view supported commands.
           renderNews();
           chartStatus.textContent = "Chart: set FINNHUB key to load live data";
           priceLine.setAttribute("points", "");
+          await refreshRatesBar();
           updateStatus("missing FINNHUB key");
           return;
         }
@@ -677,12 +834,13 @@ Type HELP to view supported commands.
           setOutput("No API key set. Use SETKEY FRED <key> to begin.");
           headlines = [];
           renderNews();
+          await refreshRatesBar();
           updateStatus("missing FRED key");
           return;
         }
         updateStatus("refreshing...");
         await refreshWatchlist();
-        await refreshNews();
+        await Promise.all([refreshNews(), refreshRatesBar()]);
         await refreshChart();
         updateStatus("live");
         refreshInput.classList.remove("refresh-flash");
@@ -701,7 +859,7 @@ Type HELP to view supported commands.
         // All handlers are async for uniform dispatch.
         HELP: async () => {
           setOutput(
-            "Available commands:\nHELP\nNEWS\nCLEAR\nREFRESH\nSOURCE <FINNHUB|FRED>\nSETKEY <FINNHUB|FRED> <API_KEY>\nCLEARKEY <FINNHUB|FRED>\nSETINTERVAL <SECONDS>\nTICKER <SYMBOL>\nADD <SYMBOL>\nREMOVE <SYMBOL>\nSERIES <FRED_SERIES_ID>\nCLEARWATCHLIST CONFIRM"
+            "Available commands:\nHELP\nNEWS\nRATES\nCLEAR\nREFRESH\nSOURCE <FINNHUB|FRED>\nVIEW <TECH|BANKS|MACRO|CRYPTO|CUSTOM>\nSETKEY <FINNHUB|FRED> <API_KEY>\nCLEARKEY <FINNHUB|FRED>\nSETINTERVAL <SECONDS>\nTICKER <SYMBOL>\nADD <SYMBOL>\nREMOVE <SYMBOL>\nSERIES <FRED_SERIES_ID>\nCLEARWATCHLIST CONFIRM"
           );
         },
         NEWS: async () => {
@@ -710,6 +868,10 @@ Type HELP to view supported commands.
         REFRESH: async () => {
           await refreshAll();
           setOutput("Manual refresh completed.");
+        },
+        RATES: async () => {
+          await refreshRatesBar();
+          setOutput("Rates bar refreshed.");
         },
         CLEAR: async () => {
           setOutput("");
@@ -725,6 +887,27 @@ Type HELP to view supported commands.
           updateStatus(`source set to ${requestedSource}`);
           await refreshAll();
           setOutput(`Active source switched to ${requestedSource}.`);
+        },
+        VIEW: async (args) => {
+          const requestedView = (args[0] || "").toUpperCase();
+          if (!["TECH", "BANKS", "MACRO", "CRYPTO", "CUSTOM"].includes(requestedView)) {
+            setOutput("Usage: VIEW TECH | BANKS | MACRO | CRYPTO | CUSTOM");
+            return;
+          }
+          watchlist.length = 0;
+          if (requestedView === "CUSTOM") {
+            loadWatchlist();
+          } else {
+            views[requestedView].forEach((item) => {
+              watchlist.push({ symbol: item.symbol, type: item.type, last: 0, chg: 0 });
+            });
+            state.activeView = requestedView;
+          }
+          saveConfig();
+          pickInitialSelectedSymbol();
+          renderWatchlist();
+          setOutput(`Switched to view: ${requestedView}. Refreshing...`);
+          await refreshAll();
         },
         SETKEY: async (args) => {
           if (args.length < 2) {
@@ -804,9 +987,11 @@ Type HELP to view supported commands.
           }
           try {
             const validatedQuote = await fetchFinnhubQuote(symbol);
+            state.activeView = "CUSTOM";
             addSymbol(symbol, "market");
             updateSymbol(symbol, validatedQuote);
             renderWatchlist();
+            saveConfig();
             await refreshChart();
             setOutput(`${symbol} added with live quote data.`);
           } catch (error) {
@@ -820,7 +1005,9 @@ Type HELP to view supported commands.
             return;
           }
           const wasSelected = state.selectedSymbol === symbol;
+          state.activeView = "CUSTOM";
           const removed = removeSymbol(symbol);
+          saveConfig();
           setOutput(
             removed
               ? `${symbol} removed from watchlist. Re-add will require REFRESH for latest values.`
@@ -840,9 +1027,11 @@ Type HELP to view supported commands.
           }
           try {
             const validatedSeries = await fetchFredSeries(seriesId);
+            state.activeView = "CUSTOM";
             addSymbol(seriesId, "fred");
             updateSymbol(seriesId, validatedSeries);
             renderWatchlist();
+            saveConfig();
             setOutput(`${seriesId} added as FRED series.`);
           } catch (error) {
             setOutput(`Unable to add FRED series ${seriesId}: ${error.message}`);
@@ -854,9 +1043,11 @@ Type HELP to view supported commands.
             return;
           }
           watchlist.length = 0;
+          state.activeView = "CUSTOM";
           state.selectedSymbol = null;
           saveWatchlist();
           renderWatchlist();
+          saveConfig();
           await refreshChart();
           setOutput("Watchlist cleared.");
         }
@@ -923,10 +1114,25 @@ Type HELP to view supported commands.
           .finally(() => setBusy(false));
       });
 
+      viewTabs.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-view]");
+        if (!button || state.busy) return;
+        const requestedView = button.getAttribute("data-view");
+        if (!requestedView) return;
+        setBusy(true);
+        COMMANDS.VIEW([requestedView])
+          .then(() => {
+            commandHistory.push(`VIEW ${requestedView}`);
+            historyIndex = commandHistory.length;
+          })
+          .finally(() => setBusy(false));
+      });
+
       loadConfig();
-      loadWatchlist();
+      hydrateWatchlistFromState();
       pickInitialSelectedSymbol();
       renderWatchlist();
+      renderRatesBar();
       renderNews();
       updateClock();
       setInterval(updateClock, 1000);
