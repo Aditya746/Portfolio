@@ -206,6 +206,26 @@
       min-height: 34px;
       display: flex;
       align-items: center;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .chart-status {
+      position: absolute;
+      left: 10px;
+      top: 8px;
+      color: #9ca7be;
+      font-size: 0.8rem;
+    }
+
+    .refresh-flash {
+      animation: flash 0.4s ease;
+    }
+
+    @keyframes flash {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
     }
 
     @media (max-width: 1080px) {
@@ -252,7 +272,7 @@
                 points=""
               ></polyline>
             </svg>
-            <div id="chart-status" style="position: absolute; left: 10px; top: 8px; color: #9ca7be; font-size: 0.8rem;">
+            <div id="chart-status" class="chart-status">
               Chart: waiting for live data
             </div>
           </div>
@@ -281,618 +301,635 @@ Type HELP to view supported commands.
   </div>
 
   <script>
-    const STORAGE_KEY = "bb_terminal_config_v1";
-    const WATCHLIST_KEY = "bb_terminal_watchlist_v1";
-    const MIN_REFRESH_INTERVAL_SECONDS = 15;
-    const FAST_REQUEST_DELAY_MS = 250;
-    const SLOW_REQUEST_DELAY_MS = 400;
-    const REQUEST_TIMEOUT_MS = 8000;
+    (() => {
+      const STORAGE_KEY = "bb_terminal_config_v1";
+      const WATCHLIST_KEY = "bb_terminal_watchlist_v1";
+      const CONFIG_VERSION = "v1";
+      const MIN_REFRESH_INTERVAL_SECONDS = 15;
+      const FAST_REQUEST_DELAY_MS = 250;
+      const SLOW_REQUEST_DELAY_MS = 400;
+      const REQUEST_TIMEOUT_MS = 8000;
+      const MAX_HEADLINES = 5;
 
-    const sourceInput = document.getElementById("active-source");
-    const statusInput = document.getElementById("status-line");
-    const refreshInput = document.getElementById("last-refresh");
-    const commandOutput = document.getElementById("command-output");
-    const input = document.getElementById("command-input");
-    const runButton = document.getElementById("run-command");
-    const chartStatus = document.getElementById("chart-status");
-    const priceLine = document.getElementById("price-line");
-    const chartPanelTitle = document.getElementById("chart-panel-title");
-    const watchlistBody = document.getElementById("watchlist-body");
+      const sourceInput = document.getElementById("active-source");
+      const statusInput = document.getElementById("status-line");
+      const refreshInput = document.getElementById("last-refresh");
+      const commandOutput = document.getElementById("command-output");
+      const input = document.getElementById("command-input");
+      const runButton = document.getElementById("run-command");
+      const chartStatus = document.getElementById("chart-status");
+      const priceLine = document.getElementById("price-line");
+      const chartPanelTitle = document.getElementById("chart-panel-title");
+      const watchlistBody = document.getElementById("watchlist-body");
 
-    const defaultWatchlist = [
-      { symbol: "AAPL", type: "market", last: 0, chg: 0 },
-      { symbol: "MSFT", type: "market", last: 0, chg: 0 },
-      { symbol: "NVDA", type: "market", last: 0, chg: 0 },
-      { symbol: "TSLA", type: "market", last: 0, chg: 0 },
-      { symbol: "DGS10", type: "fred", last: 0, chg: 0 }
-    ];
+      const defaultWatchlist = [
+        { symbol: "AAPL", type: "market", last: 0, chg: 0 },
+        { symbol: "MSFT", type: "market", last: 0, chg: 0 },
+        { symbol: "NVDA", type: "market", last: 0, chg: 0 },
+        { symbol: "TSLA", type: "market", last: 0, chg: 0 },
+        { symbol: "DGS10", type: "fred", last: 0, chg: 0 }
+      ];
 
-    const state = {
-      source: "FINNHUB",
-      keys: { FINNHUB: "", FRED: "" },
-      busy: false,
-      selectedSymbol: null,
-      refreshIntervalSeconds: 30
-    };
+      const state = {
+        source: "FINNHUB",
+        keys: { FINNHUB: "", FRED: "" },
+        busy: false,
+        selectedSymbol: null,
+        refreshIntervalSeconds: 30
+      };
 
-    const watchlist = [];
-    const commandHistory = [];
-    let historyIndex = 0;
-    let autoRefreshTimer = null;
-    let headlines = [];
+      const watchlist = [];
+      const commandHistory = [];
+      let historyIndex = 0;
+      let autoRefreshTimer = null;
+      let headlines = [];
 
-    function maskKey(raw) {
-      if (!raw) return "none";
-      return `${raw.slice(0, 4)}****`;
-    }
-
-    async function fetchWithTimeout(url, ms = REQUEST_TIMEOUT_MS) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), ms);
-      try {
-        return await fetch(url, { signal: controller.signal });
-      } finally {
-        clearTimeout(timeout);
+      function maskKey(raw) {
+        if (!raw) return "none";
+        return `${raw.slice(0, 4)}****`;
       }
-    }
 
-    function setBusy(flag) {
-      state.busy = flag;
-      runButton.disabled = flag;
-      runButton.textContent = flag ? "..." : "RUN";
-    }
-
-    function sleep(ms) {
-      return new Promise((resolve) => setTimeout(resolve, ms));
-    }
-
-    function updateChartTitle() {
-      chartPanelTitle.textContent = state.selectedSymbol
-        ? `CHART - ${state.selectedSymbol} (15m) + COMMAND`
-        : "CHART + COMMAND";
-    }
-
-    function saveWatchlist() {
-      localStorage.setItem(WATCHLIST_KEY, JSON.stringify(watchlist));
-    }
-
-    function pickInitialSelectedSymbol() {
-      if (state.selectedSymbol && watchlist.some((item) => item.symbol === state.selectedSymbol)) return;
-      const firstMarket = watchlist.find((item) => item.type === "market");
-      state.selectedSymbol = firstMarket ? firstMarket.symbol : null;
-    }
-
-    function addSymbol(symbol, type) {
-      watchlist.push({ symbol, type, last: 0, chg: 0 });
-      pickInitialSelectedSymbol();
-      saveWatchlist();
-      renderWatchlist();
-    }
-
-    function removeSymbol(symbol) {
-      const idx = watchlist.findIndex((item) => item.symbol === symbol);
-      if (idx === -1) return false;
-      watchlist.splice(idx, 1);
-      pickInitialSelectedSymbol();
-      saveWatchlist();
-      renderWatchlist();
-      return true;
-    }
-
-    function updateSymbol(symbol, data) {
-      const item = watchlist.find((entry) => entry.symbol === symbol);
-      if (!item) return;
-      item.last = data.last;
-      item.chg = data.chg;
-    }
-
-    function loadConfig() {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed.source) state.source = parsed.source;
-        if (parsed.keys) state.keys = { ...state.keys, ...parsed.keys };
-        if (parsed.refreshIntervalSeconds) {
-          state.refreshIntervalSeconds = Math.max(
-            MIN_REFRESH_INTERVAL_SECONDS,
-            Number(parsed.refreshIntervalSeconds) || 30
-          );
-        }
-      } catch (error) {
-        console.warn("Failed to parse stored config", error);
-        localStorage.removeItem(STORAGE_KEY);
-      }
-    }
-
-    function loadWatchlist() {
-      const raw = localStorage.getItem(WATCHLIST_KEY);
-      if (!raw) {
-        defaultWatchlist.forEach((item) => watchlist.push({ ...item }));
-        return;
-      }
-      try {
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("invalid watchlist");
-        parsed.forEach((item) => {
-          if (!item || typeof item.symbol !== "string" || !item.symbol.trim()) return;
-          watchlist.push({
-            symbol: item.symbol.toUpperCase(),
-            type: item.type === "fred" ? "fred" : "market",
-            last: Number(item.last) || 0,
-            chg: Number(item.chg) || 0
-          });
-        });
-        if (watchlist.length === 0) throw new Error("watchlist empty after validation");
-      } catch (error) {
-        console.warn("Failed to parse stored watchlist", error);
-        localStorage.removeItem(WATCHLIST_KEY);
-        watchlist.length = 0;
-        defaultWatchlist.forEach((item) => watchlist.push({ ...item }));
-      }
-    }
-
-    function saveConfig() {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({
-          source: state.source,
-          keys: state.keys,
-          refreshIntervalSeconds: state.refreshIntervalSeconds
-        })
-      );
-    }
-
-    function updateStatus(message) {
-      const activeKey = state.source === "FRED" ? state.keys.FRED : state.keys.FINNHUB;
-      statusInput.textContent = `Status: ${message} | Key: ${maskKey(activeKey)}`;
-      sourceInput.textContent = `Source: ${state.source}`;
-      refreshInput.textContent = `Refresh: ${new Date().toISOString().replace("T", " ").substring(0, 19)} UTC`;
-    }
-
-    function renderWatchlist() {
-      watchlistBody.innerHTML = watchlist
-        .map((item) => {
-          const className = item.chg >= 0 ? "up" : "down";
-          const sign = item.chg >= 0 ? "+" : "";
-          const isSelected = item.symbol === state.selectedSymbol;
-          return `
-            <tr class="${isSelected ? "selected" : ""}" data-symbol="${item.symbol}">
-              <td>${item.symbol}${item.type === "fred" ? " (FRED)" : ""}</td>
-              <td>${Number.isFinite(item.last) ? item.last.toFixed(2) : "--"}</td>
-              <td class="${className}">${Number.isFinite(item.chg) ? `${sign}${item.chg.toFixed(2)}%` : "--"}</td>
-            </tr>
-          `;
-        })
-        .join("");
-      updateChartTitle();
-    }
-
-    function renderNews() {
-      const container = document.getElementById("news-feed");
-      if (!headlines.length) {
-        container.innerHTML = `
-          <article class="news-item">
-            <span class="time">${new Date().toLocaleTimeString("en-GB", { timeZone: "UTC" })} UTC</span>
-            <div>No live headlines for this source currently.</div>
-          </article>
-        `;
-        return;
-      }
-      container.innerHTML = headlines
-        .map((item) => `
-            <article class="news-item">
-              <span class="time">${new Date(item.datetime * 1000).toLocaleTimeString("en-GB", { timeZone: "UTC" })} UTC</span>
-              <div>${item.headline}</div>
-            </article>
-        `)
-        .join("");
-    }
-
-    function updateClock() {
-      document.getElementById("clock").textContent =
-        `${new Date().toISOString().replace("T", " ").substring(0, 19)} UTC`;
-    }
-
-    async function fetchFinnhubQuote(symbol) {
-      if (!state.keys.FINNHUB) throw new Error("Missing FINNHUB API key.");
-      const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(state.keys.FINNHUB)}`;
-      const response = await fetchWithTimeout(url);
-      if (!response.ok) throw new Error(`Finnhub quote failed: HTTP ${response.status}`);
-      const data = await response.json();
-      if (typeof data.c !== "number") throw new Error("Finnhub quote returned invalid data.");
-      return { last: data.c, chg: data.dp ?? 0 };
-    }
-
-    async function fetchFredSeries(seriesId) {
-      if (!state.keys.FRED) throw new Error("Missing FRED API key.");
-      const url =
-        `https://api.stlouisfed.org/fred/series/observations?series_id=${encodeURIComponent(seriesId)}` +
-        `&api_key=${encodeURIComponent(state.keys.FRED)}&file_type=json&sort_order=desc&limit=2`;
-      const response = await fetchWithTimeout(url);
-      if (!response.ok) throw new Error(`FRED series failed: HTTP ${response.status}`);
-      const data = await response.json();
-      const observations = Array.isArray(data.observations) ? data.observations : [];
-      if (observations.length === 0) throw new Error(`No FRED data for ${seriesId}`);
-      const latest = Number.parseFloat(observations[0].value);
-      const previous = Number.parseFloat(observations[1]?.value ?? observations[0].value);
-      const chg = previous === 0 ? 0 : ((latest - previous) / Math.abs(previous)) * 100;
-      return { last: latest, chg };
-    }
-
-    async function fetchFinnhubStockCandles(symbol) {
-      const to = Math.floor(Date.now() / 1000);
-      const from = to - 60 * 60 * 24;
-      const url =
-        `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}` +
-        `&resolution=15&from=${from}&to=${to}&token=${encodeURIComponent(state.keys.FINNHUB)}`;
-      const response = await fetchWithTimeout(url);
-      if (!response.ok) throw new Error(`Finnhub candle failed: HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.s !== "ok" || !Array.isArray(data.c) || data.c.length < 2) {
-        throw new Error(`No candle data for ${symbol}`);
-      }
-      return data.c;
-    }
-
-    async function fetchFinnhubCryptoCandles(symbol) {
-      const to = Math.floor(Date.now() / 1000);
-      const from = to - 60 * 60 * 24;
-      const pair = symbol.toUpperCase().replace("-", "");
-      let providerSymbol = "";
-      if (pair === "BTCUSD") providerSymbol = "BINANCE:BTCUSDT";
-      else if (pair === "ETHUSD") providerSymbol = "BINANCE:ETHUSDT";
-      else throw new Error(`Unsupported crypto mapping for ${symbol}`);
-      const url =
-        `https://finnhub.io/api/v1/crypto/candle?symbol=${encodeURIComponent(providerSymbol)}` +
-        `&resolution=15&from=${from}&to=${to}&token=${encodeURIComponent(state.keys.FINNHUB)}`;
-      const response = await fetchWithTimeout(url);
-      if (!response.ok) throw new Error(`Finnhub crypto candle failed: HTTP ${response.status}`);
-      const data = await response.json();
-      if (data.s !== "ok" || !Array.isArray(data.c) || data.c.length < 2) {
-        throw new Error(`No crypto candle data for ${symbol}`);
-      }
-      return data.c;
-    }
-
-    function drawPriceLine(values) {
-      if (!values.length) {
-        priceLine.setAttribute("points", "");
-        return;
-      }
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const span = max - min || 1;
-      const points = values.map((value, idx) => {
-        const x = (idx / (values.length - 1)) * 100;
-        const y = 36 - ((value - min) / span) * 32;
-        return `${x.toFixed(2)},${y.toFixed(2)}`;
-      });
-      priceLine.setAttribute("points", points.join(" "));
-    }
-
-    async function refreshChart() {
-      if (!state.selectedSymbol) {
-        chartStatus.textContent = "Chart: no symbol selected";
-        priceLine.setAttribute("points", "");
-        updateChartTitle();
-        return;
-      }
-      if (state.source !== "FINNHUB") {
-        chartStatus.textContent = "Chart: available only with SOURCE FINNHUB";
-        priceLine.setAttribute("points", "");
-        updateChartTitle();
-        return;
-      }
-      try {
-        chartStatus.textContent = `Chart: loading ${state.selectedSymbol}...`;
-        const closes = state.selectedSymbol.includes("-")
-          ? await fetchFinnhubCryptoCandles(state.selectedSymbol)
-          : await fetchFinnhubStockCandles(state.selectedSymbol);
-        drawPriceLine(closes);
-        chartStatus.textContent = `Chart: ${state.selectedSymbol} last 24h (15m candles)`;
-      } catch (error) {
-        chartStatus.textContent = `Chart error: ${error.message}`;
-        priceLine.setAttribute("points", "");
-      }
-      updateChartTitle();
-    }
-
-    async function refreshWatchlist() {
-      const delayMs = watchlist.length > 8 ? SLOW_REQUEST_DELAY_MS : FAST_REQUEST_DELAY_MS;
-      for (const item of watchlist) {
+      async function fetchWithTimeout(url, ms = REQUEST_TIMEOUT_MS) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), ms);
         try {
-          if (item.type === "fred") {
-            const fred = await fetchFredSeries(item.symbol);
-            updateSymbol(item.symbol, fred);
-          } else if (state.source === "FINNHUB") {
-            const quote = await fetchFinnhubQuote(item.symbol);
-            updateSymbol(item.symbol, quote);
+          return await fetch(url, { signal: controller.signal });
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      function setBusy(flag) {
+        state.busy = flag;
+        runButton.disabled = flag;
+        runButton.textContent = flag ? "..." : "RUN";
+      }
+
+      function setOutput(text) {
+        commandOutput.textContent = text;
+        commandOutput.scrollTop = commandOutput.scrollHeight;
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function updateChartTitle() {
+        chartPanelTitle.textContent = state.selectedSymbol
+          ? `CHART - ${state.selectedSymbol} (15m) + COMMAND`
+          : "CHART + COMMAND";
+      }
+
+      function saveWatchlist() {
+        const compact = watchlist.map((item) => ({ symbol: item.symbol, type: item.type }));
+        localStorage.setItem(WATCHLIST_KEY, JSON.stringify(compact));
+      }
+
+      function pickInitialSelectedSymbol() {
+        if (state.selectedSymbol && watchlist.some((item) => item.symbol === state.selectedSymbol)) return;
+        const firstMarket = watchlist.find((item) => item.type === "market");
+        state.selectedSymbol = firstMarket ? firstMarket.symbol : null;
+        updateChartTitle();
+      }
+
+      function addSymbol(symbol, type) {
+        watchlist.push({ symbol, type, last: 0, chg: 0 });
+        pickInitialSelectedSymbol();
+        saveWatchlist();
+        renderWatchlist();
+      }
+
+      function removeSymbol(symbol) {
+        const idx = watchlist.findIndex((item) => item.symbol === symbol);
+        if (idx === -1) return false;
+        watchlist.splice(idx, 1);
+        pickInitialSelectedSymbol();
+        saveWatchlist();
+        renderWatchlist();
+        return true;
+      }
+
+      function updateSymbol(symbol, data) {
+        const item = watchlist.find((entry) => entry.symbol === symbol);
+        if (!item) return;
+        item.last = data.last;
+        item.chg = data.chg;
+      }
+
+      function loadConfig() {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return;
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed.version && parsed.version !== CONFIG_VERSION) throw new Error("config version mismatch");
+          if (parsed.source) state.source = parsed.source;
+          if (parsed.keys) state.keys = { ...state.keys, ...parsed.keys };
+          if (parsed.refreshIntervalSeconds) {
+            state.refreshIntervalSeconds = Math.max(
+              MIN_REFRESH_INTERVAL_SECONDS,
+              Number(parsed.refreshIntervalSeconds) || 30
+            );
           }
         } catch (error) {
-          console.warn(`Failed to refresh ${item.symbol}`, error);
+          console.warn("Failed to parse stored config", error);
+          localStorage.removeItem(STORAGE_KEY);
         }
-        await sleep(delayMs);
       }
-      saveWatchlist();
-      renderWatchlist();
-    }
 
-    async function refreshNews() {
-      try {
-        if (state.source === "FINNHUB" && state.keys.FINNHUB) {
-          const url = `https://finnhub.io/api/v1/news?category=general&token=${encodeURIComponent(state.keys.FINNHUB)}`;
-          const response = await fetchWithTimeout(url);
-          if (!response.ok) throw new Error(`Finnhub news failed: HTTP ${response.status}`);
-          const data = await response.json();
-          headlines = data.slice(0, 5).map((item) => ({
-            headline: item.headline,
-            datetime: item.datetime || Math.floor(Date.now() / 1000)
-          }));
-        } else {
+      function loadWatchlist() {
+        const raw = localStorage.getItem(WATCHLIST_KEY);
+        if (!raw) {
+          defaultWatchlist.forEach((item) => watchlist.push({ ...item }));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(raw);
+          if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("invalid watchlist");
+          parsed.forEach((item) => {
+            if (!item || typeof item.symbol !== "string" || !item.symbol.trim()) return;
+            watchlist.push({
+              symbol: item.symbol.toUpperCase(),
+              type: item.type === "fred" ? "fred" : "market",
+              last: 0,
+              chg: 0
+            });
+          });
+          if (watchlist.length === 0) throw new Error("watchlist empty after validation");
+        } catch (error) {
+          console.warn("Failed to parse stored watchlist", error);
+          localStorage.removeItem(WATCHLIST_KEY);
+          watchlist.length = 0;
+          defaultWatchlist.forEach((item) => watchlist.push({ ...item }));
+        }
+      }
+
+      function saveConfig() {
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({
+            version: CONFIG_VERSION,
+            source: state.source,
+            keys: state.keys,
+            refreshIntervalSeconds: state.refreshIntervalSeconds
+          })
+        );
+      }
+
+      function updateStatus(message) {
+        const activeKey = state.source === "FRED" ? state.keys.FRED : state.keys.FINNHUB;
+        statusInput.textContent = `Status: ${message} | Key: ${maskKey(activeKey)}`;
+        sourceInput.textContent = `Source: ${state.source}`;
+        refreshInput.textContent = `Refresh: ${new Date().toISOString().replace("T", " ").substring(0, 19)} UTC`;
+      }
+
+      function renderWatchlist() {
+        watchlistBody.innerHTML = watchlist
+          .map((item) => {
+            const className = item.chg >= 0 ? "up" : "down";
+            const sign = item.chg >= 0 ? "+" : "";
+            const isSelected = item.symbol === state.selectedSymbol;
+            return `
+              <tr class="${isSelected ? "selected" : ""}" data-symbol="${item.symbol}">
+                <td>${item.symbol}${item.type === "fred" ? " (FRED)" : ""}</td>
+                <td>${Number.isFinite(item.last) ? item.last.toFixed(2) : "--"}</td>
+                <td class="${className}">${Number.isFinite(item.chg) ? `${sign}${item.chg.toFixed(2)}%` : "--"}</td>
+              </tr>
+            `;
+          })
+          .join("");
+      }
+
+      function renderNews() {
+        const container = document.getElementById("news-feed");
+        if (!headlines.length) {
+          container.innerHTML = `
+            <article class="news-item">
+              <span class="time">${new Date().toLocaleTimeString("en-GB", { timeZone: "UTC" })} UTC</span>
+              <div>No live headlines for this source currently.</div>
+            </article>
+          `;
+          return;
+        }
+        container.innerHTML = headlines
+          .map((item) => `
+              <article class="news-item">
+                <span class="time">${new Date(item.datetime * 1000).toLocaleTimeString("en-GB", { timeZone: "UTC" })} UTC</span>
+                <div>${item.headline}</div>
+              </article>
+          `)
+          .join("");
+      }
+
+      function updateClock() {
+        document.getElementById("clock").textContent =
+          `${new Date().toISOString().replace("T", " ").substring(0, 19)} UTC`;
+      }
+
+      async function fetchFinnhubQuote(symbol) {
+        if (!state.keys.FINNHUB) throw new Error("Missing FINNHUB API key.");
+        const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${encodeURIComponent(state.keys.FINNHUB)}`;
+        const response = await fetchWithTimeout(url);
+        if (!response.ok) throw new Error(`Finnhub quote failed: HTTP ${response.status}`);
+        const data = await response.json();
+        if (typeof data.c !== "number") throw new Error("Finnhub quote returned invalid data.");
+        return { last: data.c, chg: data.dp ?? 0 };
+      }
+
+      async function fetchFredSeries(seriesId) {
+        if (!state.keys.FRED) throw new Error("Missing FRED API key.");
+        const url =
+          `https://api.stlouisfed.org/fred/series/observations?series_id=${encodeURIComponent(seriesId)}` +
+          `&api_key=${encodeURIComponent(state.keys.FRED)}&file_type=json&sort_order=desc&limit=2`;
+        const response = await fetchWithTimeout(url);
+        if (!response.ok) throw new Error(`FRED series failed: HTTP ${response.status}`);
+        const data = await response.json();
+        const observations = Array.isArray(data.observations) ? data.observations : [];
+        if (observations.length === 0) throw new Error(`No FRED data for ${seriesId}`);
+        const latest = Number.parseFloat(observations[0].value);
+        const previous = Number.parseFloat(observations[1]?.value ?? observations[0].value);
+        const chg = previous === 0 ? 0 : ((latest - previous) / Math.abs(previous)) * 100;
+        return { last: latest, chg };
+      }
+
+      async function fetchFinnhubCandles(symbol) {
+        const isCrypto = symbol.includes("-");
+        const to = Math.floor(Date.now() / 1000);
+        const from = to - 60 * 60 * 24;
+        const endpoint = isCrypto ? "crypto/candle" : "stock/candle";
+        const providerSymbol = isCrypto
+          ? `BINANCE:${symbol.toUpperCase().replace("-", "").replace("USD", "USDT")}`
+          : symbol;
+        const url =
+          `https://finnhub.io/api/v1/${endpoint}?symbol=${encodeURIComponent(providerSymbol)}` +
+          `&resolution=15&from=${from}&to=${to}&token=${encodeURIComponent(state.keys.FINNHUB)}`;
+        const response = await fetchWithTimeout(url);
+        if (!response.ok) throw new Error(`Finnhub candle failed: HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.s !== "ok" || !Array.isArray(data.c) || data.c.length < 2) {
+          throw new Error(`No candle data for ${symbol}`);
+        }
+        return data.c;
+      }
+
+      function drawPriceLine(values) {
+        if (!values.length) {
+          priceLine.setAttribute("points", "");
+          return;
+        }
+        const min = values.reduce((acc, value) => Math.min(acc, value), Infinity);
+        const max = values.reduce((acc, value) => Math.max(acc, value), -Infinity);
+        const span = max - min || 1;
+        const points = values.map((value, idx) => {
+          const x = (idx / (values.length - 1)) * 100;
+          const y = 36 - ((value - min) / span) * 32;
+          return `${x.toFixed(2)},${y.toFixed(2)}`;
+        });
+        priceLine.setAttribute("points", points.join(" "));
+      }
+
+      async function refreshChart() {
+        if (!state.selectedSymbol) {
+          chartStatus.textContent = "Chart: no symbol selected";
+          priceLine.setAttribute("points", "");
+          updateChartTitle();
+          return;
+        }
+        if (state.source !== "FINNHUB") {
+          chartStatus.textContent = "Chart: available only with SOURCE FINNHUB";
+          priceLine.setAttribute("points", "");
+          updateChartTitle();
+          return;
+        }
+        try {
+          chartStatus.textContent = `Chart: loading ${state.selectedSymbol}...`;
+          const closes = await fetchFinnhubCandles(state.selectedSymbol);
+          drawPriceLine(closes);
+          chartStatus.textContent = `Chart: ${state.selectedSymbol} last 24h (15m candles)`;
+        } catch (error) {
+          chartStatus.textContent = state.selectedSymbol.includes("-")
+            ? "Chart: symbol not supported on free tier"
+            : `Chart error: ${error.message}`;
+          priceLine.setAttribute("points", "");
+        }
+        updateChartTitle();
+      }
+
+      async function refreshWatchlist() {
+        const delayMs = watchlist.length > 8 ? SLOW_REQUEST_DELAY_MS : FAST_REQUEST_DELAY_MS;
+        for (const item of watchlist) {
+          try {
+            if (item.type === "fred") {
+              const fred = await fetchFredSeries(item.symbol);
+              updateSymbol(item.symbol, fred);
+            } else if (state.source === "FINNHUB") {
+              const quote = await fetchFinnhubQuote(item.symbol);
+              updateSymbol(item.symbol, quote);
+            }
+          } catch (error) {
+            console.warn(`Failed to refresh ${item.symbol}`, error);
+          }
+          await sleep(delayMs);
+        }
+        renderWatchlist();
+      }
+
+      async function refreshNews() {
+        try {
+          if (state.source === "FINNHUB" && state.keys.FINNHUB) {
+            const url = `https://finnhub.io/api/v1/news?category=general&token=${encodeURIComponent(state.keys.FINNHUB)}`;
+            const response = await fetchWithTimeout(url);
+            if (!response.ok) throw new Error(`Finnhub news failed: HTTP ${response.status}`);
+            const data = await response.json();
+            headlines = data.slice(0, MAX_HEADLINES).map((item) => ({
+              headline: item.headline,
+              datetime: item.datetime || Math.floor(Date.now() / 1000)
+            }));
+          } else {
+            headlines = [];
+          }
+        } catch (error) {
+          headlines = [{ headline: `News refresh error: ${error.message}`, datetime: Math.floor(Date.now() / 1000) }];
+        }
+        renderNews();
+      }
+
+      async function refreshAll() {
+        if (state.source === "FINNHUB" && !state.keys.FINNHUB) {
+          setOutput("No API key set. Use SETKEY FINNHUB <key> to begin.");
           headlines = [];
+          renderNews();
+          chartStatus.textContent = "Chart: set FINNHUB key to load live data";
+          priceLine.setAttribute("points", "");
+          updateStatus("missing FINNHUB key");
+          return;
         }
-      } catch (error) {
-        headlines = [{ headline: `News refresh error: ${error.message}`, datetime: Math.floor(Date.now() / 1000) }];
+        if (state.source === "FRED" && !state.keys.FRED) {
+          setOutput("No API key set. Use SETKEY FRED <key> to begin.");
+          headlines = [];
+          renderNews();
+          updateStatus("missing FRED key");
+          return;
+        }
+        updateStatus("refreshing...");
+        await refreshWatchlist();
+        await refreshNews();
+        await refreshChart();
+        updateStatus("live");
+        refreshInput.classList.remove("refresh-flash");
+        void refreshInput.offsetWidth;
+        refreshInput.classList.add("refresh-flash");
       }
-      renderNews();
-    }
 
-    async function refreshAll() {
-      let finalStatus = "live";
-      if (state.source === "FINNHUB" && !state.keys.FINNHUB) {
-        commandOutput.textContent = "No API key set. Use SETKEY FINNHUB <key> to begin.";
-        headlines = [];
-        renderNews();
-        chartStatus.textContent = "Chart: set FINNHUB key to load live data";
-        priceLine.setAttribute("points", "");
-        finalStatus = "missing FINNHUB key";
-        updateStatus(finalStatus);
-        return;
+      function setAutoRefreshInterval(seconds) {
+        if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+        autoRefreshTimer = setInterval(() => {
+          if (document.visibilityState === "visible") refreshAll();
+        }, seconds * 1000);
       }
-      if (state.source === "FRED" && !state.keys.FRED) {
-        commandOutput.textContent = "No API key set. Use SETKEY FRED <key> to begin.";
-        headlines = [];
-        renderNews();
-        finalStatus = "missing FRED key";
-        updateStatus(finalStatus);
-        return;
-      }
-      updateStatus("refreshing...");
-      await refreshWatchlist();
-      await refreshNews();
-      await refreshChart();
-      updateStatus(finalStatus);
-    }
 
-    function setAutoRefreshInterval(seconds) {
-      if (autoRefreshTimer) clearInterval(autoRefreshTimer);
-      autoRefreshTimer = setInterval(() => {
-        if (document.visibilityState === "visible") refreshAll();
-      }, seconds * 1000);
-    }
-
-    const COMMANDS = {
-      // All handlers are async for uniform dispatch.
-      HELP: async () => {
-        commandOutput.textContent =
-          "Available commands:\nHELP\nNEWS\nCLEAR\nREFRESH\nSOURCE <FINNHUB|FRED>\nSETKEY <FINNHUB|FRED> <API_KEY>\nCLEARKEY <FINNHUB|FRED>\nSETINTERVAL <SECONDS>\nTICKER <SYMBOL>\nADD <SYMBOL>\nREMOVE <SYMBOL>\nSERIES <FRED_SERIES_ID>";
-      },
-      NEWS: async () => {
-        commandOutput.textContent = headlines.length
-          ? headlines.map((item) => item.headline).join("\n")
-          : "No live headlines available for the current source.";
-      },
-      REFRESH: async () => {
-        await refreshAll();
-        commandOutput.textContent = "Manual refresh completed.";
-      },
-      CLEAR: async () => {
-        commandOutput.textContent = "";
-      },
-      SOURCE: async (args) => {
-        const requestedSource = (args[0] || "").toUpperCase();
-        if (!["FINNHUB", "FRED"].includes(requestedSource)) {
-          commandOutput.textContent = "Usage: SOURCE FINNHUB | FRED";
-          return;
-        }
-        state.source = requestedSource;
-        saveConfig();
-        updateStatus(`source set to ${requestedSource}`);
-        await refreshAll();
-        commandOutput.textContent = `Active source switched to ${requestedSource}.`;
-      },
-      SETKEY: async (args) => {
-        if (args.length < 2) {
-          commandOutput.textContent = "Usage: SETKEY FINNHUB <key> or SETKEY FRED <key>";
-          return;
-        }
-        const provider = (args[0] || "").toUpperCase();
-        const key = args.slice(1).join(" ").trim();
-        if (!["FINNHUB", "FRED"].includes(provider)) {
-          commandOutput.textContent = "SETKEY supports FINNHUB or FRED only.";
-          return;
-        }
-        if (!key) {
-          commandOutput.textContent = "API key cannot be empty.";
-          return;
-        }
-        state.keys[provider] = key;
-        saveConfig();
-        updateStatus(`${provider} key saved`);
-        commandOutput.textContent =
-          `${provider} API key saved to localStorage.\nWarning: key is visible in browser Network tab. For personal use only.`;
-      },
-      CLEARKEY: async (args) => {
-        const provider = (args[0] || "").toUpperCase();
-        if (!["FINNHUB", "FRED"].includes(provider)) {
-          commandOutput.textContent = "Usage: CLEARKEY FINNHUB | FRED";
-          return;
-        }
-        state.keys[provider] = "";
-        saveConfig();
-        updateStatus(`${provider} key cleared`);
-        commandOutput.textContent = `${provider} key cleared from localStorage.`;
-      },
-      SETINTERVAL: async (args) => {
-        const seconds = Number(args[0]);
-        if (!Number.isFinite(seconds) || seconds < MIN_REFRESH_INTERVAL_SECONDS) {
-          commandOutput.textContent = `Usage: SETINTERVAL <SECONDS>, minimum ${MIN_REFRESH_INTERVAL_SECONDS}`;
-          return;
-        }
-        state.refreshIntervalSeconds = Math.floor(seconds);
-        saveConfig();
-        setAutoRefreshInterval(state.refreshIntervalSeconds);
-        commandOutput.textContent = `Auto-refresh interval set to ${state.refreshIntervalSeconds}s.`;
-      },
-      TICKER: async (args) => {
-        const symbol = (args[0] || "").toUpperCase();
-        if (!symbol) {
-          commandOutput.textContent = "Usage: TICKER <SYMBOL>";
-          return;
-        }
-        const found = watchlist.find((w) => w.symbol === symbol);
-        if (!found) {
-          commandOutput.textContent = `Ticker ${symbol} not found in watchlist.`;
-          return;
-        }
-        if (found.type === "market") {
-          state.selectedSymbol = found.symbol;
+      const COMMANDS = {
+        // All handlers are async for uniform dispatch.
+        HELP: async () => {
+          setOutput(
+            "Available commands:\nHELP\nNEWS\nCLEAR\nREFRESH\nSOURCE <FINNHUB|FRED>\nSETKEY <FINNHUB|FRED> <API_KEY>\nCLEARKEY <FINNHUB|FRED>\nSETINTERVAL <SECONDS>\nTICKER <SYMBOL>\nADD <SYMBOL>\nREMOVE <SYMBOL>\nSERIES <FRED_SERIES_ID>\nCLEARWATCHLIST CONFIRM"
+          );
+        },
+        NEWS: async () => {
+          setOutput("Headlines shown in right panel. Use REFRESH to update.");
+        },
+        REFRESH: async () => {
+          await refreshAll();
+          setOutput("Manual refresh completed.");
+        },
+        CLEAR: async () => {
+          setOutput("");
+        },
+        SOURCE: async (args) => {
+          const requestedSource = (args[0] || "").toUpperCase();
+          if (!["FINNHUB", "FRED"].includes(requestedSource)) {
+            setOutput("Usage: SOURCE FINNHUB | FRED");
+            return;
+          }
+          state.source = requestedSource;
+          saveConfig();
+          updateStatus(`source set to ${requestedSource}`);
+          await refreshAll();
+          setOutput(`Active source switched to ${requestedSource}.`);
+        },
+        SETKEY: async (args) => {
+          if (args.length < 2) {
+            setOutput("Usage: SETKEY FINNHUB <key> or SETKEY FRED <key>");
+            return;
+          }
+          const provider = (args[0] || "").toUpperCase();
+          const key = args.slice(1).join(" ").trim();
+          if (!["FINNHUB", "FRED"].includes(provider)) {
+            setOutput("SETKEY supports FINNHUB or FRED only.");
+            return;
+          }
+          if (!key) {
+            setOutput("API key cannot be empty.");
+            return;
+          }
+          state.keys[provider] = key;
+          saveConfig();
+          updateStatus(`${provider} key saved`);
+          setOutput(`${provider} API key saved to localStorage.\nWarning: key is visible in browser Network tab. For personal use only.`);
+        },
+        CLEARKEY: async (args) => {
+          const provider = (args[0] || "").toUpperCase();
+          if (!["FINNHUB", "FRED"].includes(provider)) {
+            setOutput("Usage: CLEARKEY FINNHUB | FRED");
+            return;
+          }
+          state.keys[provider] = "";
+          saveConfig();
+          updateStatus(`${provider} key cleared`);
+          setOutput(`${provider} key cleared from localStorage.`);
+        },
+        SETINTERVAL: async (args) => {
+          const seconds = Number(args[0]);
+          if (!Number.isFinite(seconds) || seconds < MIN_REFRESH_INTERVAL_SECONDS) {
+            setOutput(`Usage: SETINTERVAL <SECONDS>, minimum ${MIN_REFRESH_INTERVAL_SECONDS}`);
+            return;
+          }
+          state.refreshIntervalSeconds = Math.floor(seconds);
+          saveConfig();
+          setAutoRefreshInterval(state.refreshIntervalSeconds);
+          setOutput(`Auto-refresh interval set to ${state.refreshIntervalSeconds}s.`);
+        },
+        TICKER: async (args) => {
+          const symbol = (args[0] || "").toUpperCase();
+          if (!symbol) {
+            setOutput("Usage: TICKER <SYMBOL>");
+            return;
+          }
+          const found = watchlist.find((w) => w.symbol === symbol);
+          if (!found) {
+            setOutput(`Ticker ${symbol} not found in watchlist.`);
+            return;
+          }
+          if (found.type === "market") {
+            state.selectedSymbol = found.symbol;
+            renderWatchlist();
+            await refreshChart();
+            setOutput(`${found.symbol} | Last ${found.last.toFixed(2)} | Chg ${found.chg.toFixed(2)}%`);
+            return;
+          }
+          setOutput(`${found.symbol} | Last ${found.last.toFixed(2)} | Chg ${found.chg.toFixed(2)}%\n(FRED series - chart not available)`);
+        },
+        ADD: async (args) => {
+          if (state.source !== "FINNHUB") {
+            setOutput("ADD requires SOURCE FINNHUB.");
+            return;
+          }
+          const symbol = (args[0] || "").toUpperCase();
+          if (!symbol) {
+            setOutput("Usage: ADD <SYMBOL>");
+            return;
+          }
+          if (watchlist.some((w) => w.symbol === symbol)) {
+            setOutput(`${symbol} is already in watchlist.`);
+            return;
+          }
+          try {
+            const validatedQuote = await fetchFinnhubQuote(symbol);
+            addSymbol(symbol, "market");
+            updateSymbol(symbol, validatedQuote);
+            renderWatchlist();
+            await refreshChart();
+            setOutput(`${symbol} added with live quote data.`);
+          } catch (error) {
+            setOutput(`Unable to add ${symbol}: ${error.message}`);
+          }
+        },
+        REMOVE: async (args) => {
+          const symbol = (args[0] || "").toUpperCase();
+          if (!symbol) {
+            setOutput("Usage: REMOVE <SYMBOL>");
+            return;
+          }
+          const wasSelected = state.selectedSymbol === symbol;
+          const removed = removeSymbol(symbol);
+          setOutput(
+            removed
+              ? `${symbol} removed from watchlist. Re-add will require REFRESH for latest values.`
+              : `${symbol} not found in watchlist.`
+          );
+          if (removed && wasSelected) await refreshChart();
+        },
+        SERIES: async (args) => {
+          const seriesId = (args[0] || "").toUpperCase();
+          if (!seriesId) {
+            setOutput("Usage: SERIES <FRED_SERIES_ID>");
+            return;
+          }
+          if (watchlist.some((w) => w.symbol === seriesId)) {
+            setOutput(`${seriesId} is already in watchlist.`);
+            return;
+          }
+          try {
+            const validatedSeries = await fetchFredSeries(seriesId);
+            addSymbol(seriesId, "fred");
+            updateSymbol(seriesId, validatedSeries);
+            renderWatchlist();
+            setOutput(`${seriesId} added as FRED series.`);
+          } catch (error) {
+            setOutput(`Unable to add FRED series ${seriesId}: ${error.message}`);
+          }
+        },
+        CLEARWATCHLIST: async (args) => {
+          if ((args[0] || "").toUpperCase() !== "CONFIRM") {
+            setOutput("Usage: CLEARWATCHLIST CONFIRM");
+            return;
+          }
+          watchlist.length = 0;
+          state.selectedSymbol = null;
+          saveWatchlist();
           renderWatchlist();
           await refreshChart();
-          commandOutput.textContent = `${found.symbol} | Last ${found.last.toFixed(2)} | Chg ${found.chg.toFixed(2)}%`;
-          return;
+          setOutput("Watchlist cleared.");
         }
-        commandOutput.textContent =
-          `${found.symbol} | Last ${found.last.toFixed(2)} | Chg ${found.chg.toFixed(2)}%\n(FRED series - chart not available)`;
-      },
-      ADD: async (args) => {
-        const symbol = (args[0] || "").toUpperCase();
-        if (!symbol) {
-          commandOutput.textContent = "Usage: ADD <SYMBOL>";
-          return;
-        }
-        if (watchlist.some((w) => w.symbol === symbol)) {
-          commandOutput.textContent = `${symbol} is already in watchlist.`;
-          return;
-        }
-        try {
-          const validatedQuote = await fetchFinnhubQuote(symbol);
-          addSymbol(symbol, "market");
-          updateSymbol(symbol, validatedQuote);
-          renderWatchlist();
-          await refreshChart();
-          commandOutput.textContent = `${symbol} added with live quote data.`;
-        } catch (error) {
-          commandOutput.textContent = `Unable to add ${symbol}: ${error.message}`;
-        }
-      },
-      REMOVE: async (args) => {
-        const symbol = (args[0] || "").toUpperCase();
-        if (!symbol) {
-          commandOutput.textContent = "Usage: REMOVE <SYMBOL>";
-          return;
-        }
-        const wasSelected = state.selectedSymbol === symbol;
-        const removed = removeSymbol(symbol);
-        commandOutput.textContent = removed
-          ? `${symbol} removed from watchlist. Re-add will require REFRESH for latest values.`
-          : `${symbol} not found in watchlist.`;
-        if (removed && wasSelected) await refreshChart();
-      },
-      SERIES: async (args) => {
-        const seriesId = (args[0] || "").toUpperCase();
-        if (!seriesId) {
-          commandOutput.textContent = "Usage: SERIES <FRED_SERIES_ID>";
-          return;
-        }
-        if (watchlist.some((w) => w.symbol === seriesId)) {
-          commandOutput.textContent = `${seriesId} is already in watchlist.`;
-          return;
-        }
-        try {
-          const validatedSeries = await fetchFredSeries(seriesId);
-          addSymbol(seriesId, "fred");
-          updateSymbol(seriesId, validatedSeries);
-          renderWatchlist();
-          commandOutput.textContent = `${seriesId} added as FRED series.`;
-        } catch (error) {
-          commandOutput.textContent = `Unable to add FRED series ${seriesId}: ${error.message}`;
-        }
-      }
-    };
+      };
 
-    async function runCommand() {
-      const raw = input.value.trim();
-      if (!raw) {
-        commandOutput.textContent = "No command entered.";
-        return;
-      }
-      // verb is uppercased for lookup; args preserve original case for keys.
-      const [verb, ...args] = raw.split(/\s+/);
-      const handler = COMMANDS[verb.toUpperCase()];
-      if (!handler) {
-        commandOutput.textContent = `Unknown command: ${raw}\nType HELP.`;
+      async function runCommand() {
+        const raw = input.value.trim();
+        if (!raw) {
+          setOutput("No command entered.");
+          return;
+        }
+        // verb is uppercased for lookup; args preserve original case for keys.
+        const [verb, ...args] = raw.split(/\s+/);
+        const handler = COMMANDS[verb.toUpperCase()];
+        if (!handler) {
+          setOutput(`Unknown command: ${raw}\nType HELP.`);
+          input.value = "";
+          return;
+        }
+
+        setBusy(true);
+        try {
+          await handler(args);
+          commandHistory.push(raw);
+          historyIndex = commandHistory.length;
+        } finally {
+          setBusy(false);
+        }
         input.value = "";
-        return;
       }
 
-      setBusy(true);
-      try {
-        await handler(args);
-        commandHistory.push(raw);
-        historyIndex = commandHistory.length;
-      } finally {
-        setBusy(false);
-      }
-      input.value = "";
-    }
+      runButton.addEventListener("click", runCommand);
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          runCommand();
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          if (commandHistory.length === 0) return;
+          historyIndex = Math.max(0, historyIndex - 1);
+          input.value = commandHistory[historyIndex] || "";
+        }
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          if (commandHistory.length === 0) return;
+          historyIndex = Math.min(commandHistory.length, historyIndex + 1);
+          input.value = commandHistory[historyIndex] || "";
+        }
+      });
 
-    runButton.addEventListener("click", runCommand);
-    input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        runCommand();
-        return;
-      }
-      if (event.key === "ArrowUp") {
-        event.preventDefault();
-        if (commandHistory.length === 0) return;
-        historyIndex = Math.max(0, historyIndex - 1);
-        input.value = commandHistory[historyIndex] || "";
-      }
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        if (commandHistory.length === 0) return;
-        historyIndex = Math.min(commandHistory.length, historyIndex + 1);
-        input.value = commandHistory[historyIndex] || "";
-      }
-    });
+      watchlistBody.addEventListener("click", (event) => {
+        const row = event.target.closest("tr[data-symbol]");
+        if (!row || state.busy) return;
+        const symbol = row.getAttribute("data-symbol");
+        if (!symbol) return;
+        // Routes through TICKER handler which guards FRED types.
+        setBusy(true);
+        COMMANDS.TICKER([symbol])
+          .then(() => {
+            commandHistory.push(`TICKER ${symbol}`);
+            historyIndex = commandHistory.length;
+          })
+          .finally(() => setBusy(false));
+      });
 
-    watchlistBody.addEventListener("click", (event) => {
-      const row = event.target.closest("tr[data-symbol]");
-      if (!row) return;
-      const symbol = row.getAttribute("data-symbol");
-      if (!symbol) return;
-      input.value = `TICKER ${symbol}`;
-      runCommand();
-    });
-
-    loadConfig();
-    loadWatchlist();
-    pickInitialSelectedSymbol();
-    renderWatchlist();
-    renderNews();
-    updateClock();
-    setInterval(updateClock, 1000);
-    setAutoRefreshInterval(state.refreshIntervalSeconds);
-    if (
-      (state.source === "FINNHUB" && !state.keys.FINNHUB) ||
-      (state.source === "FRED" && !state.keys.FRED)
-    ) {
-      updateStatus("ready - run REFRESH or set key");
-    } else {
-      refreshAll();
-    }
+      loadConfig();
+      loadWatchlist();
+      pickInitialSelectedSymbol();
+      renderWatchlist();
+      renderNews();
+      updateClock();
+      setInterval(updateClock, 1000);
+      setAutoRefreshInterval(state.refreshIntervalSeconds);
+      if (
+        (state.source === "FINNHUB" && !state.keys.FINNHUB) ||
+        (state.source === "FRED" && !state.keys.FRED)
+      ) {
+        updateStatus("ready - run REFRESH or set key");
+      } else {
+        refreshAll();
+      }
+    })();
   </script>
 </body>
 </html>
