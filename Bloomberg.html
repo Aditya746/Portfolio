@@ -306,6 +306,8 @@
         <div style="display:flex;gap:3px" id="chart-range-btns">
           <button class="ph-action range-btn active" data-range="1D">1D</button>
           <button class="ph-action range-btn" data-range="1W">1W</button>
+          <button class="ph-action range-btn" data-range="1M">1M</button>
+          <button class="ph-action range-btn" data-range="3M">3M</button>
         </div>
       </div>
       <div class="chart-area" id="chart-area">
@@ -388,7 +390,7 @@
 
     const cfg = {
       source: 'FINNHUB',
-      keys: { FINNHUB: '', FRED: '', EXCHANGERATE: '', COINGECKO: '' },
+      keys: { FINNHUB: '', FRED: '', EXCHANGERATE: '', COINGECKO: '', TWELVEDATA: '' },
       interval: 30,
       view: 'CUSTOM'
     };
@@ -443,6 +445,25 @@
     const TAG_COLORS = { FED:'var(--red)', MACRO:'var(--blue)', TECH:'var(--green)', CRYPTO:'var(--amber)', RATES:'var(--teal)' };
     const TAG_ORDER = ['FED','MACRO','TECH','CRYPTO','RATES'];
 
+    const RSS_SOURCES = {
+      GLOBAL: [
+        { name:'Reuters',  url:'https://feeds.reuters.com/reuters/businessNews' },
+        { name:'BBC',      url:'https://feeds.bbci.co.uk/news/business/rss.xml' },
+        { name:'AP',       url:'https://rsshub.app/apnews/topics/business' },
+      ],
+      INDIA: [
+        { name:'ET Markets',    url:'https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms' },
+        { name:'Moneycontrol',  url:'https://www.moneycontrol.com/rss/MCtopnews.xml' },
+        { name:'LiveMint',      url:'https://www.livemint.com/rss/markets' },
+      ],
+      CRYPTO: [
+        { name:'CoinDesk',      url:'https://www.coindesk.com/arc/outboundfeeds/rss/' },
+        { name:'CoinTelegraph', url:'https://cointelegraph.com/rss' },
+      ]
+    };
+
+    const CORS_PROXY = 'https://api.allorigins.win/get?url=';
+
     let watchlist = [];
     let ratesData  = {};
     let headlines  = [];
@@ -461,6 +482,9 @@
     let cgCacheTs   = 0;
     let quoteHistory= {};
     let newsFilter  = 'ALL';
+    let newsTab = 'ALL';
+    let savedHeadlines = JSON.parse(localStorage.getItem('pt_saved_news') || '[]');
+    let rssHeadlines   = { GLOBAL:[], INDIA:[], CRYPTO:[] };
     let forexPrev   = {};
 
     const $ = id => document.getElementById(id);
@@ -703,6 +727,58 @@
       return d.c;
     }
 
+    async function fetchTwelveDataCandles(sym, range) {
+      if (!cfg.keys.TWELVEDATA) throw new Error('No TWELVEDATA key');
+
+      const intervalMap = { '1D':'15min', '1W':'1h', '1M':'1day', '3M':'1day' };
+      const sizeMap     = { '1D':96,      '1W':168,  '1M':30,     '3M':90   };
+      const interval    = intervalMap[range] || '15min';
+      const outputsize  = sizeMap[range]     || 96;
+
+      const tdSym = sym.includes('-')
+        ? sym.replace('-USD', '/USD')
+        : sym;
+
+      const url = `https://api.twelvedata.com/time_series`
+        + `?symbol=${encodeURIComponent(tdSym)}`
+        + `&interval=${interval}`
+        + `&outputsize=${outputsize}`
+        + `&order=ASC`
+        + `&apikey=${cfg.keys.TWELVEDATA}`;
+
+      const r = await fetchTo(url);
+      if (!r.ok) throw new Error(`TwelveData HTTP ${r.status}`);
+      const d = await r.json();
+      if (d.status === 'error') throw new Error(d.message || 'TwelveData error');
+      if (!Array.isArray(d.values) || d.values.length < 2)
+        throw new Error('No candle data');
+
+      return d.values.map(v => ({
+        o: parseFloat(v.open),
+        h: parseFloat(v.high),
+        l: parseFloat(v.low),
+        c: parseFloat(v.close),
+        v: parseFloat(v.volume) || 0
+      }));
+    }
+
+    async function fetchCoinGeckoCandles(sym) {
+      const id = COINGECKO_MAP[sym];
+      if (!id) throw new Error('Not in CoinGecko map');
+      const url = `https://api.coingecko.com/api/v3/coins/${id}/market_chart`
+        + `?vs_currency=usd&days=1&interval=hourly`;
+      const headers = {};
+      if (cfg.keys.COINGECKO) headers['x-cg-demo-api-key'] = cfg.keys.COINGECKO;
+      const r = await fetchTo(url, { headers });
+      if (!r.ok) throw new Error(`CoinGecko chart HTTP ${r.status}`);
+      const d = await r.json();
+      if (!Array.isArray(d.prices) || d.prices.length < 2)
+        throw new Error('No CoinGecko chart data');
+      return d.prices.map(([, price]) => ({
+        o: price, h: price, l: price, c: price, v: 0
+      }));
+    }
+
     async function fetchNews(){
       if(!cfg.keys.FINNHUB) return [];
       const r=await fetchTo(`https://finnhub.io/api/v1/news?category=general&token=${cfg.keys.FINNHUB}`);
@@ -720,6 +796,47 @@
           tags
         };
       });
+    }
+
+    async function fetchRSSFeed(source) {
+      const url   = CORS_PROXY + encodeURIComponent(source.url);
+      const r     = await fetchTo(url);
+      if (!r.ok) throw new Error(`RSS HTTP ${r.status}`);
+      const json  = await r.json();
+      const xml   = new DOMParser().parseFromString(json.contents, 'text/xml');
+      const items = [...xml.querySelectorAll('item')];
+      return items.slice(0, 8).map(item => {
+        const get  = tag => item.querySelector(tag)?.textContent?.trim() || '';
+        const pub  = get('pubDate');
+        const dt   = pub ? Math.floor(new Date(pub).getTime() / 1000)
+                         : Math.floor(Date.now() / 1000);
+        const text = (get('title') + ' ' + get('description')).trim();
+        return {
+          headline: get('title'),
+          summary:  get('description').replace(/<[^>]*>/g,'').slice(0, 200),
+          source:   source.name,
+          url:      get('link'),
+          datetime: dt,
+          tags:     tagHeadline(text)
+        };
+      });
+    }
+
+    async function fetchRSSCategory(category) {
+      const sources = RSS_SOURCES[category] || [];
+      const results = await Promise.allSettled(sources.map(s => fetchRSSFeed(s)));
+      const items   = results
+        .filter(r => r.status === 'fulfilled')
+        .flatMap(r => r.value);
+      const seen = new Set();
+      return items
+        .filter(n => {
+          const key = n.headline.slice(0, 40).toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key); return true;
+        })
+        .sort((a, b) => b.datetime - a.datetime)
+        .slice(0, 20);
     }
 
     function renderClock(){
@@ -841,88 +958,289 @@
       }).join('');
     }
 
-    function renderNewsFilterBar(){
-      const tags=['ALL','MACRO','TECH','CRYPTO','FED','RATES'];
-      elNewsFilter.innerHTML=tags.map(t=>
-        `<button class="vtab ${newsFilter===t?'active':''}" data-nfilter="${t}">${t}</button>`
-      ).join('');
+    function renderNewsTabs() {
+      const tabs = ['ALL','GLOBAL','INDIA','CRYPTO','SAVED'];
+      elNewsFilter.innerHTML = tabs.map(t => {
+        const isActive = newsTab === t;
+        let badge = '';
+        if (t === 'GLOBAL') badge = rssHeadlines.GLOBAL.length
+          ? ` <span style="font-size:8px;opacity:0.6">${rssHeadlines.GLOBAL.length}</span>` : '';
+        if (t === 'INDIA')  badge = rssHeadlines.INDIA.length
+          ? ` <span style="font-size:8px;opacity:0.6">${rssHeadlines.INDIA.length}</span>`  : '';
+        if (t === 'CRYPTO') badge = rssHeadlines.CRYPTO.length
+          ? ` <span style="font-size:8px;opacity:0.6">${rssHeadlines.CRYPTO.length}</span>` : '';
+        if (t === 'SAVED')  badge = savedHeadlines.length
+          ? ` <span style="font-size:8px;opacity:0.6">${savedHeadlines.length}</span>`      : '';
+        return `<button class="vtab ${isActive?'active':''}" data-ntab="${t}">${t}${badge}</button>`;
+      }).join('');
     }
 
-    function renderNews(){
-      renderNewsFilterBar();
-      if(!headlines.length){
-        elNewsScroll.innerHTML='<div class="news-empty"><div style="color:var(--dim);font-size:20px">📰</div>No headlines — set FINNHUB key</div>';
+    function renderNews() {
+      renderNewsTabs();
+
+      let items = [];
+      if (newsTab === 'ALL') {
+        const all = [
+          ...headlines,
+          ...rssHeadlines.GLOBAL,
+          ...rssHeadlines.INDIA,
+          ...rssHeadlines.CRYPTO
+        ];
+        const seen = new Set();
+        items = all
+          .filter(n => {
+            const key = n.headline.slice(0, 40).toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key); return true;
+          })
+          .sort((a, b) => b.datetime - a.datetime)
+          .slice(0, 30);
+      } else if (newsTab === 'SAVED') {
+        items = savedHeadlines;
+      } else {
+        items = rssHeadlines[newsTab] || [];
+      }
+
+      if (newsFilter !== 'ALL') {
+        items = items.filter(n => (n.tags || []).includes(newsFilter));
+      }
+
+      if (!items.length) {
+        elNewsScroll.innerHTML = newsTab === 'SAVED'
+          ? '<div class="news-empty">No saved headlines — click ★ to save</div>'
+          : newsTab === 'ALL' && !headlines.length && !rssHeadlines.GLOBAL.length
+            ? '<div class="news-empty">Set FINNHUB key or wait for RSS load</div>'
+            : `<div class="news-empty">No headlines for ${newsTab}${newsFilter!=='ALL'?' · '+newsFilter:''}</div>`;
         return;
       }
-      const filtered=newsFilter==='ALL'?headlines:headlines.filter(n=>(n.tags||[]).includes(newsFilter));
-      if(!filtered.length){
-        elNewsScroll.innerHTML='<div class="news-empty">No headlines for filter '+newsFilter+'</div>';
-        return;
-      }
-      elNewsScroll.innerHTML=filtered.map(n=>{
-        const dt=new Date(n.datetime*1000);
-        const timeStr=dt.toLocaleTimeString('en-GB',{timeZone:'UTC',hour:'2-digit',minute:'2-digit'});
-        const dateStr=dt.toLocaleDateString('en-GB',{timeZone:'UTC',day:'2-digit',month:'short'});
-        const pt=primaryTag(n.tags||[]);
-        const dotColor=pt?TAG_COLORS[pt]:'var(--dim)';
-        return `<div class="news-item" data-url="${n.url}">
+
+      elNewsScroll.innerHTML = items.map(n => {
+        const dt      = new Date(n.datetime * 1000);
+        const timeStr = dt.toLocaleTimeString('en-GB',
+          { timeZone:'UTC', hour:'2-digit', minute:'2-digit' });
+        const dateStr = dt.toLocaleDateString('en-GB',
+          { timeZone:'UTC', day:'2-digit', month:'short' });
+        const pt       = primaryTag(n.tags || []);
+        const dotColor = pt ? TAG_COLORS[pt] : 'var(--dim)';
+        const isSaved  = savedHeadlines.some(s => s.headline === n.headline);
+        const starCol  = isSaved ? 'var(--amber)' : 'var(--dim)';
+
+        return `<div class="news-item" data-url="${n.url}" data-headline="${
+          encodeURIComponent(n.headline)}">
           <div style="display:flex;gap:8px;align-items:flex-start">
-            <span class="news-tag-dot" style="background:${dotColor}"></span>
+            <span class="news-tag-dot" style="background:${dotColor};margin-top:5px"></span>
             <div style="flex:1;min-width:0">
-              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                ${n.source?`<span class="news-source">${n.source.toUpperCase()}</span>`:''}
-                <span class="news-time">${dateStr} ${timeStr} UTC</span>
+              <div style="display:flex;gap:6px;align-items:center;justify-content:space-between">
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                  ${n.source
+                    ? `<span class="news-source">${n.source.toUpperCase()}</span>`
+                    : ''}
+                  <span class="news-time">${dateStr} ${timeStr} UTC</span>
+                </div>
+                <button class="news-star" data-idx="${encodeURIComponent(n.headline)}"
+                  style="background:none;border:none;cursor:pointer;color:${starCol};
+                         font-size:11px;padding:0 2px;flex-shrink:0"
+                  title="${isSaved?'Unsave':'Save'}">★</button>
               </div>
               <div class="news-headline">${n.headline}</div>
-              ${n.summary&&n.summary!==n.headline?`<div class="news-summary">${n.summary.slice(0,140)}${n.summary.length>140?'…':''}</div>`:''}
+              ${n.summary && n.summary !== n.headline
+                ? `<div class="news-summary">${n.summary.slice(0,140)}${
+                    n.summary.length > 140 ? '…' : ''}</div>`
+                : ''}
             </div>
           </div>
         </div>`;
       }).join('');
     }
 
-    function drawChart(closes){
-      if(!closes||closes.length<2){
-        elChartLine.setAttribute('points','');
-        elChartFill.setAttribute('d','');
+    function drawChart(candles) {
+      const svg = document.getElementById('chart-svg');
+      [...svg.querySelectorAll('.chart-candle,.chart-wick,.chart-vol,.chart-sma,.chart-axis-label,.chart-crosshair')]
+        .forEach(el => el.remove());
+
+      if (!candles || candles.length < 2) {
+        elChartLine.setAttribute('points', '');
+        elChartFill.setAttribute('d', '');
         return;
       }
-      const min=Math.min(...closes),max=Math.max(...closes);
-      const span=max-min||1;
-      const W=600,H=220,PAD=15;
-      const pts=closes.map((v,i)=>{
-        const x=(i/(closes.length-1))*W;
-        const y=PAD+(H-PAD*2)*(1-((v-min)/span));
-        return [x,y];
+
+      elChartLine.setAttribute('points', '');
+      elChartFill.setAttribute('d', '');
+
+      const W = 600, H = 180, PAD_T = 10, PAD_B = 30, PAD_L = 8, PAD_R = 48;
+      const chartW = W - PAD_L - PAD_R;
+      const chartH = H - PAD_T - PAD_B;
+      const VOL_H  = 28;
+
+      const highs  = candles.map(c => c.h);
+      const lows   = candles.map(c => c.l);
+      const vols   = candles.map(c => c.v);
+      const minP   = Math.min(...lows);
+      const maxP   = Math.max(...highs);
+      const spanP  = maxP - minP || 1;
+      const maxV   = Math.max(...vols) || 1;
+
+      const px = i  => PAD_L + (i / (candles.length - 1)) * chartW;
+      const py = v  => PAD_T + chartH - ((v - minP) / spanP) * chartH;
+      const pv = v  => VOL_H * (v / maxV);
+
+      const candleW = Math.max(1, Math.min(8, (chartW / candles.length) * 0.7));
+
+      const priceSteps = 4;
+      for (let i = 0; i <= priceSteps; i++) {
+        const v   = minP + (spanP * i / priceSteps);
+        const y   = py(v);
+        const lbl = v >= 1000 ? v.toFixed(0) : v.toFixed(v < 1 ? 4 : 2);
+        const el  = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        el.setAttribute('x', W - PAD_R + 4);
+        el.setAttribute('y', y + 3);
+        el.setAttribute('fill', '#3d4f6b');
+        el.setAttribute('font-size', '8');
+        el.setAttribute('font-family', 'IBM Plex Mono, monospace');
+        el.classList.add('chart-axis-label');
+        el.textContent = lbl;
+        svg.appendChild(el);
+      }
+
+      candles.forEach((c, i) => {
+        if (!c.v) return;
+        const x   = px(i);
+        const h   = pv(c.v);
+        const col = c.c >= c.o ? 'rgba(0,201,122,0.25)' : 'rgba(240,69,90,0.25)';
+        const el  = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        el.setAttribute('x',      x - candleW / 2);
+        el.setAttribute('y',      H - PAD_B - h + 2);
+        el.setAttribute('width',  candleW);
+        el.setAttribute('height', h);
+        el.setAttribute('fill',   col);
+        el.classList.add('chart-vol');
+        svg.appendChild(el);
       });
-      elChartLine.setAttribute('points',pts.map(p=>p.join(',')).join(' '));
-      const last=pts[pts.length-1];
-      const d=`M${pts[0][0]},${H} `+pts.map(p=>`L${p[0]},${p[1]}`).join(' ')+` L${last[0]},${H} Z`;
-      elChartFill.setAttribute('d',d);
+
+      candles.forEach((c, i) => {
+        const x   = px(i);
+        const col = c.c >= c.o ? '#00c97a' : '#f0455a';
+        const el  = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+        el.setAttribute('x1',           x);
+        el.setAttribute('x2',           x);
+        el.setAttribute('y1',           py(c.h));
+        el.setAttribute('y2',           py(c.l));
+        el.setAttribute('stroke',       col);
+        el.setAttribute('stroke-width', '0.8');
+        el.classList.add('chart-wick');
+        svg.appendChild(el);
+      });
+
+      candles.forEach((c, i) => {
+        const x      = px(i);
+        const isUp   = c.c >= c.o;
+        const bodyT  = py(Math.max(c.o, c.c));
+        const bodyB  = py(Math.min(c.o, c.c));
+        const bodyH  = Math.max(1, bodyB - bodyT);
+        const col    = isUp ? '#00c97a' : '#f0455a';
+        const el     = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        el.setAttribute('x',      x - candleW / 2);
+        el.setAttribute('y',      bodyT);
+        el.setAttribute('width',  candleW);
+        el.setAttribute('height', bodyH);
+        el.setAttribute('fill',   isUp ? 'rgba(0,201,122,0.85)' : 'rgba(240,69,90,0.85)');
+        el.setAttribute('stroke', col);
+        el.setAttribute('stroke-width', '0.5');
+        el.classList.add('chart-candle');
+        svg.appendChild(el);
+      });
+
+      if (candles.length >= 20) {
+        const smaPoints = [];
+        for (let i = 19; i < candles.length; i++) {
+          const avg = candles.slice(i - 19, i + 1).reduce((s, c) => s + c.c, 0) / 20;
+          smaPoints.push(`${px(i)},${py(avg)}`);
+        }
+        const el = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+        el.setAttribute('points',       smaPoints.join(' '));
+        el.setAttribute('fill',         'none');
+        el.setAttribute('stroke',       '#4da8ff');
+        el.setAttribute('stroke-width', '0.8');
+        el.setAttribute('opacity',      '0.6');
+        el.classList.add('chart-sma');
+        svg.appendChild(el);
+      }
     }
 
-    function setChartDisplay(sym,closes){
-      const resLbl=chartRange==='1W'?'60m':'15m';
-      elChartTitle.textContent=sym?`Chart · ${sym} (${resLbl})`:'Chart';
-      elChartSym.textContent=sym||'—';
-      if(!sym){ elChartSub.textContent='Select a symbol'; return; }
-      if(!closes||!closes.length){
-        elChartSub.textContent='No chart data';
-        elChartPrice.textContent='';
-        elChartChg.textContent='';
+    function setChartDisplay(sym, candles) {
+      const resLbl = { '1D':'15m', '1W':'1h', '1M':'1d', '3M':'1d' }[chartRange] || '15m';
+      elChartTitle.textContent = sym ? `Chart · ${sym} (${resLbl})` : 'Chart';
+      elChartSym.textContent   = sym || '—';
+
+      if (!sym) { elChartSub.textContent = 'Select a symbol'; return; }
+      if (!candles || !candles.length) {
+        elChartSub.textContent = 'No chart data';
+        elChartPrice.textContent = '';
+        elChartChg.textContent = '';
         return;
       }
-      drawChart(closes);
-      const item=watchlist.find(w=>w.sym===sym);
-      const dec=item&&item.type==='forex'?4:2;
-      if(item&&Number.isFinite(item.last)){
-        elChartPrice.textContent=fmt(item.last,dec);
-        elChartPrice.className='chart-price '+(item.chg>=0?'up':'down');
-        elChartChg.textContent=fmtChg(item.chg);
-        elChartChg.className='chart-sub '+(item.chg>=0?'up':'down');
+
+      drawChart(candles);
+
+      const item = watchlist.find(w => w.sym === sym);
+      const dec  = item && item.type === 'forex' ? 4 : 2;
+      if (item && Number.isFinite(item.last)) {
+        elChartPrice.textContent  = fmt(item.last, dec);
+        elChartPrice.className    = 'chart-price ' + (item.chg >= 0 ? 'up' : 'down');
+        elChartChg.textContent    = fmtChg(item.chg);
+        elChartChg.className      = 'chart-sub '   + (item.chg >= 0 ? 'up' : 'down');
       }
-      if(chartSimulated) elChartSub.textContent='Simulated trend (live quotes)';
-      else elChartSub.textContent=`${closes.length} candles · last ${chartRange==='1W'?'7d':'24-48h'}`;
+
+      if (chartSimulated) {
+        elChartSub.textContent = 'Simulated trend (live quotes)';
+      } else {
+        const n = candles.length;
+        elChartSub.textContent = `${n} candles · ${chartRange}` +
+          (cfg.keys.TWELVEDATA ? ' · Twelve Data' : ' · CoinGecko');
+      }
+    }
+
+    function setupChartHover() {
+      const area = document.getElementById('chart-area');
+      const svg  = document.getElementById('chart-svg');
+      let tooltip = document.getElementById('chart-tooltip');
+      if (!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.id = 'chart-tooltip';
+        tooltip.style.cssText = [
+          'position:absolute','pointer-events:none','display:none',
+          'background:#0d1320','border:1px solid #1e2d47',
+          'padding:5px 8px','font-size:10px','font-family:IBM Plex Mono,monospace',
+          'color:#e8edf5','white-space:nowrap','z-index:10',
+          'border-radius:2px','line-height:1.6'
+        ].join(';');
+        area.appendChild(tooltip);
+      }
+
+      area.addEventListener('mousemove', e => {
+        if (!chartData || chartData.length < 2) return;
+        const rect  = area.getBoundingClientRect();
+        const xPct  = (e.clientX - rect.left) / rect.width;
+        const idx   = Math.round(xPct * (chartData.length - 1));
+        const c     = chartData[Math.max(0, Math.min(idx, chartData.length - 1))];
+        if (!c) return;
+        const col   = c.c >= c.o ? '#00c97a' : '#f0455a';
+        const dec   = c.c < 1 ? 6 : c.c < 100 ? 4 : 2;
+        tooltip.innerHTML = [
+          `<span style="color:#6b7fa0">O</span> ${c.o.toFixed(dec)}  `,
+          `<span style="color:#6b7fa0">H</span> <span style="color:#00c97a">${c.h.toFixed(dec)}</span>  `,
+          `<span style="color:#6b7fa0">L</span> <span style="color:#f0455a">${c.l.toFixed(dec)}</span>  `,
+          `<span style="color:#6b7fa0">C</span> <span style="color:${col}">${c.c.toFixed(dec)}</span>`
+        ].join('');
+        tooltip.style.display = 'block';
+        const tx = Math.min(e.clientX - rect.left + 10, rect.width - 200);
+        tooltip.style.left = tx + 'px';
+        tooltip.style.top  = '8px';
+      });
+
+      area.addEventListener('mouseleave', () => {
+        tooltip.style.display = 'none';
+      });
     }
 
     function updateChartRangeBtns(){
@@ -1019,54 +1337,54 @@
       }
     }
 
-    async function refreshChart(sym){
-      chartSimulated=false;
-      if(!sym){
-        elChartSub.textContent='Select a symbol';
-        return;
+    async function refreshChart(sym) {
+      chartSimulated = false;
+      if (!sym) { elChartSub.textContent = 'Select a symbol'; return; }
+
+      const item = watchlist.find(w => w.sym === sym);
+      if (item && item.type === 'fred') {
+        elChartSub.textContent = 'FRED series – chart N/A';
+        chartData = []; drawChart([]); return;
       }
-      const item=watchlist.find(w=>w.sym===sym);
-      if(item&&(item.type==='fred'||item.type==='forex')){
-        elChartSub.textContent=item.type==='fred'?'FRED series – chart N/A':'Forex – use quote history';
-        const hist=quoteHistory[sym];
-        if(hist&&hist.length>=2){
-          chartData=hist;
-          chartSimulated=true;
-          setChartDisplay(sym,hist);
-        } else {
-          chartData=[]; drawChart([]);
+
+      elChartSub.textContent = 'Loading…';
+      let candles = null;
+
+      if (cfg.keys.TWELVEDATA) {
+        try {
+          candles = await fetchTwelveDataCandles(sym, chartRange);
+        } catch(e) {
+          console.warn('TwelveData chart fail:', e.message);
         }
-        return;
       }
-      if(!cfg.keys.FINNHUB){
-        const hist=quoteHistory[sym];
-        if(hist&&hist.length>=2){
-          chartData=hist; chartSimulated=true;
-          setChartDisplay(sym,hist);
-        } else elChartSub.textContent='Set FINNHUB key for chart';
-        return;
-      }
-      elChartSub.textContent='Loading…';
-      try{
-        const closes=await fetchFinnhubCandles(sym,chartRange);
-        chartData=closes;
-        setChartDisplay(sym,closes);
-      }catch(e){
-        const msg=e.message||'';
-        if(msg.includes('403')){
-          const hist=quoteHistory[sym];
-          if(hist&&hist.length>=2){
-            chartData=hist;
-            chartSimulated=true;
-            setChartDisplay(sym,hist);
-            return;
-          }
+
+      if (!candles && COINGECKO_MAP[sym]) {
+        try {
+          candles = await fetchCoinGeckoCandles(sym);
+        } catch(e) {
+          console.warn('CoinGecko chart fail:', e.message);
         }
-        chartData=[];
+      }
+
+      if (!candles) {
+        const hist = quoteHistory[sym];
+        if (hist && hist.length >= 2) {
+          candles = hist.map(c => ({ o:c, h:c, l:c, c:c, v:0 }));
+          chartSimulated = true;
+        }
+      }
+
+      if (!candles || candles.length < 2) {
+        chartData = [];
         drawChart([]);
-        if(msg.includes('403')) elChartSub.textContent='Candles blocked — collecting live quotes';
-        else elChartSub.textContent=`Chart error: ${msg.slice(0,60)}`;
+        elChartSub.textContent = cfg.keys.TWELVEDATA
+          ? 'No data returned'
+          : 'Set TWELVEDATA key for real charts (twelvedata.com)';
+        return;
       }
+
+      chartData = candles;
+      setChartDisplay(sym, candles);
     }
 
     async function refreshNews(){
@@ -1079,6 +1397,18 @@
       renderNews();
     }
 
+    async function refreshRSSNews() {
+      const [global, india, crypto] = await Promise.allSettled([
+        fetchRSSCategory('GLOBAL'),
+        fetchRSSCategory('INDIA'),
+        fetchRSSCategory('CRYPTO')
+      ]);
+      if (global.status  === 'fulfilled') rssHeadlines.GLOBAL  = global.value;
+      if (india.status   === 'fulfilled') rssHeadlines.INDIA   = india.value;
+      if (crypto.status  === 'fulfilled') rssHeadlines.CRYPTO  = crypto.value;
+      renderNews();
+    }
+
     async function refreshAll(){
       const hasKey=cfg.keys.FINNHUB||cfg.keys.FRED||cfg.keys.EXCHANGERATE;
       const canCrypto=watchlist.some(w=>COINGECKO_MAP[w.sym]);
@@ -1086,6 +1416,7 @@
       await Promise.all([
         refreshWatchlist(),
         refreshNews(),
+        refreshRSSNews(),
         refreshRates()
       ]);
       if(selectedSym) await refreshChart(selectedSym);
@@ -1133,7 +1464,10 @@
     VIEW FOREX                 — switch to forex watchlist view
     HEATMAP                    — show text heatmap in output
     FILTER &lt;tag&gt;               — filter news (ALL/MACRO/TECH/CRYPTO/FED/RATES)
-    CHART &lt;sym&gt; &lt;1D|1W&gt;        — select symbol and chart range
+    SETKEY TWELVEDATA &lt;key&gt;   — real candle charts (twelvedata.com, 800/day free)
+    CHART &lt;sym&gt; &lt;1D|1W|1M|3M&gt;   — select symbol and chart range
+    SAVE                    — show saved headlines count
+    SAVE CLEAR              — clear all saved headlines
 
   <span class="info">↑/↓ history · / focus command · Esc blur</span>`);
       },
@@ -1158,7 +1492,7 @@
       SETKEY: async(args)=>{
         const p=(args[0]||'').toUpperCase();
         const k=args.slice(1).join(' ').trim();
-        const allowed=['FINNHUB','FRED','EXCHANGERATE','COINGECKO'];
+        const allowed=['FINNHUB','FRED','EXCHANGERATE','COINGECKO','TWELVEDATA'];
         if(!allowed.includes(p)||!k){ out('<span class="err">Usage: SETKEY '+allowed.join('|')+' &lt;key&gt;</span>'); return; }
         cfg.keys[p]=k; saveCfg();
         if(p==='EXCHANGERATE') fxCache={};
@@ -1170,7 +1504,7 @@
       },
       CLEARKEY: async([p])=>{
         const pr=(p||'').toUpperCase();
-        const allowed=['FINNHUB','FRED','EXCHANGERATE','COINGECKO'];
+        const allowed=['FINNHUB','FRED','EXCHANGERATE','COINGECKO','TWELVEDATA'];
         if(!allowed.includes(pr)){ out('<span class="err">Usage: CLEARKEY '+allowed.join('|')+'</span>'); return; }
         cfg.keys[pr]=''; saveCfg();
         if(pr==='EXCHANGERATE') fxCache={};
@@ -1294,11 +1628,23 @@
         newsFilter=t; renderNews();
         out(`<span class="ok">✓ News filter → ${t}</span>`);
       },
+      SAVE: async([action])=>{
+        if((action||'').toUpperCase()==='CLEAR'){
+          savedHeadlines=[];
+          localStorage.setItem('pt_saved_news','[]');
+          renderNews();
+          out('<span class="ok">✓ Saved headlines cleared</span>');
+          return;
+        }
+        out(`<span class="ok">Saved: ${savedHeadlines.length} headlines</span>
+  Click ★ on any headline to save/unsave.
+  <span class="info">SAVE CLEAR</span> to remove all saved.`);
+      },
       CHART: async(args)=>{
         const sym=(args[0]||'').toUpperCase();
         const rng=(args[1]||'').toUpperCase();
-        if(!sym||!['1D','1W'].includes(rng)){
-          out('<span class="err">Usage: CHART &lt;symbol&gt; &lt;1D|1W&gt;</span>'); return;
+        if(!sym||!['1D','1W','1M','3M'].includes(rng)){
+          out('<span class="err">Usage: CHART &lt;symbol&gt; &lt;1D|1W|1M|3M&gt;</span>'); return;
         }
         const item=watchlist.find(w=>w.sym===sym);
         if(!item){ out(`<span class="err">${sym} not in watchlist</span>`); return; }
@@ -1306,7 +1652,7 @@
         updateChartRangeBtns();
         selectedSym=sym;
         renderWatchlist();
-        const resLbl=rng==='1W'?'60m':'15m';
+        const resLbl={'1D':'15m','1W':'1h','1M':'1d','3M':'1d'}[rng]||'15m';
         elChartTitle.textContent=`Chart · ${sym} (${resLbl})`;
         out(`<span class="spinner"></span> Loading chart ${sym} (${rng})…`);
         await refreshChart(sym);
@@ -1361,15 +1707,45 @@
     $('btn-refresh-news').addEventListener('click',()=>{ if(!busy) refreshNews(); });
 
     elNewsScroll.addEventListener('click',e=>{
+      const star=e.target.closest('.news-star');
+      if(star){
+        e.stopPropagation();
+        const key=decodeURIComponent(star.getAttribute('data-idx'));
+        const allItems=[
+          ...headlines,
+          ...rssHeadlines.GLOBAL,
+          ...rssHeadlines.INDIA,
+          ...rssHeadlines.CRYPTO
+        ];
+        const found=allItems.find(n=>n.headline===key);
+        if(found){
+          const idx=savedHeadlines.findIndex(s=>s.headline===key);
+          if(idx===-1) savedHeadlines.unshift(found);
+          else savedHeadlines.splice(idx,1);
+          savedHeadlines=savedHeadlines.slice(0,50);
+          localStorage.setItem('pt_saved_news',JSON.stringify(savedHeadlines));
+          renderNews();
+        }
+        return;
+      }
       const item=e.target.closest('.news-item[data-url]');
       if(item&&item.dataset.url) window.open(item.dataset.url,'_blank');
     });
 
     elNewsFilter.addEventListener('click',e=>{
-      const btn=e.target.closest('button[data-nfilter]');
-      if(!btn) return;
-      newsFilter=btn.getAttribute('data-nfilter');
-      renderNews();
+      const tabBtn=e.target.closest('button[data-ntab]');
+      if(tabBtn){
+        newsTab=tabBtn.getAttribute('data-ntab');
+        if(newsTab!=='ALL'&&newsTab!=='SAVED'&&
+            rssHeadlines[newsTab]&&rssHeadlines[newsTab].length===0){
+          fetchRSSCategory(newsTab).then(items=>{
+            rssHeadlines[newsTab]=items;
+            renderNews();
+          });
+        } else {
+          renderNews();
+        }
+      }
     });
 
     elChartRangeBtns.addEventListener('click',e=>{
@@ -1402,6 +1778,7 @@
     renderRatesBar();
     renderNews();
     renderClock();
+    setupChartHover();
     updateChartRangeBtns();
     setInterval(renderClock,1000);
 
@@ -1409,6 +1786,7 @@
     setRefreshTimer();
 
     refreshRates();
+    refreshRSSNews();
     const hasKey=cfg.keys.FINNHUB||cfg.keys.FRED||cfg.keys.EXCHANGERATE;
     const canCrypto=watchlist.some(w=>COINGECKO_MAP[w.sym]);
     if(hasKey||canCrypto){ refreshAll(); }
